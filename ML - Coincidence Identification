@@ -29,7 +29,7 @@ y_min, y_max = 0, 2000
 # -----------------------------
 # 4. Detect bright coincidence dots
 # -----------------------------
-threshold = 100
+threshold = 180
 
 bright_mask = plot >= threshold
 
@@ -52,8 +52,8 @@ for center in centers:
     energy_y = y_max - (y_pixel / height) * (y_max - y_min)
 
     coincidences.append({
-        "Energy_X_keV": round(energy_x / 50) * 50,
-        "Energy_Y_keV": round(energy_y / 50) * 50
+        "Energy_X_keV": round(energy_x / 100) * 100,
+        "Energy_Y_keV": round(energy_y / 100) * 100
     })
 
 # -----------------------------
@@ -92,3 +92,4 @@ print(sees_list)
 sees_list.to_csv(
     r"C:\Users\sdbry\Downloads\energy_sees_list.csv",
     index=False
+)
