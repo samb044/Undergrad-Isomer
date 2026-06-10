@@ -1,0 +1,94 @@
+import numpy as np
+import pandas as pd
+from PIL import Image
+from scipy.ndimage import label, center_of_mass
+
+# -----------------------------
+# 1. Load image
+# -----------------------------
+img = Image.open(
+    r"C:\Users\sdbry\Downloads\matrix1.png"
+).convert("L")
+
+gray = np.array(img)
+
+# -----------------------------
+# 2. Crop only the actual plot area
+# Adjust these numbers if needed
+# -----------------------------
+plot = gray[115:785, 43:710]
+
+height, width = plot.shape
+
+# -----------------------------
+# 3. Energy axis range
+# -----------------------------
+x_min, x_max = 0, 2000
+y_min, y_max = 0, 2000
+
+# -----------------------------
+# 4. Detect bright coincidence dots
+# -----------------------------
+threshold = 100
+
+bright_mask = plot >= threshold
+
+labeled, num_features = label(bright_mask)
+
+centers = center_of_mass(
+    bright_mask,
+    labeled,
+    range(1, num_features + 1)
+)
+
+coincidences = []
+
+for center in centers:
+    y_pixel, x_pixel = center
+
+    energy_x = x_min + (x_pixel / width) * (x_max - x_min)
+
+    # y-axis is flipped in image coordinates
+    energy_y = y_max - (y_pixel / height) * (y_max - y_min)
+
+    coincidences.append({
+        "Energy_X_keV": round(energy_x / 50) * 50,
+        "Energy_Y_keV": round(energy_y / 50) * 50
+    })
+
+# -----------------------------
+# 5. Create coincidence table
+# -----------------------------
+df = pd.DataFrame(coincidences)
+
+df = df.drop_duplicates()
+df = df.sort_values(["Energy_X_keV", "Energy_Y_keV"])
+
+print("Detected Coincidences:")
+print(df)
+
+df.to_csv(
+    r"C:\Users\sdbry\Downloads\detected_coincidences.csv",
+    index=False
+)
+
+# -----------------------------
+# 6. Group by energy: what each energy sees
+# -----------------------------
+sees_list = (
+    df.groupby("Energy_X_keV")["Energy_Y_keV"]
+    .apply(lambda values: sorted(set(values)))
+    .reset_index()
+)
+
+sees_list = sees_list.rename(columns={
+    "Energy_X_keV": "Energy_keV",
+    "Energy_Y_keV": "Sees_keV"
+})
+
+print("\nWhat each energy sees:")
+print(sees_list)
+
+sees_list.to_csv(
+    r"C:\Users\sdbry\Downloads\energy_sees_list.csv",
+    index=False
