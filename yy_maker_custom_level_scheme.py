@@ -3,9 +3,10 @@ import pickle
 import matplotlib.pyplot as plt
 from matplotlib.cm import ScalarMappable
 import scipy
-from scipy.ndimage import gaussian_filter
 import os
-from itertools import combinations
+from pathlib import Path
+from level_scheme_plotter import plot_branching_level_scheme
+
 
 def lerp(a, b, p):
     return b * p + a * (1 - p)
@@ -98,6 +99,7 @@ def convolve(input, kernel):
     output = scipy.signal.convolve(input, kernel, mode="same")
     return output
 
+
 def apply_compton(x, y, chance_to_scatter=0.9):
     if np.random.rand() < chance_to_scatter:
         # Compton Escape Scattering
@@ -125,6 +127,7 @@ def apply_compton(x, y, chance_to_scatter=0.9):
                 y = y * np.random.rand()
     return (int(x), int(y))
 
+
 def CreateNewMat(num_gamma_rays, size_mat, level_scheme, chance_to_scatter):
     #Create a matrix with and without scattering for peak comparison
     coinc_mat = np.zeros((size_mat, size_mat))
@@ -138,14 +141,13 @@ def CreateNewMat(num_gamma_rays, size_mat, level_scheme, chance_to_scatter):
         current_idx = int(start)
  
         while current_idx != -1:
-            ev_current, next_idx, _ = level_scheme[current_idx]
+            gamma_e, next_idx, _ = level_scheme[current_idx]
             next_idx = int(next_idx)
  
             if next_idx == -1:
                 break
- 
-            ev_next, _, _ = level_scheme[next_idx]
-            gamma_e = int(ev_current) - int(ev_next)
+
+            gamma_e = int(gamma_e)
 
             if 0 < gamma_e < size_mat:
                 gammas.append(gamma_e)
@@ -207,6 +209,7 @@ def CreateCustomTransitionScheme(specify_by_index=True):
 
 
 def CreateNewTransitionScheme(ev_levels):
+    # ev_levels are actual gamma energies, not the energies themselves
     transition_scheme = []
 
     for i, level in enumerate(ev_levels):
@@ -276,214 +279,177 @@ def CreateSample(sim_size, draw_background, custom_transition_scheme=False):
             num_gamma_rays, arr_size, transition_scheme.copy(), 0.45
         )
     else:
+        # Added coinc_mat_no_scatter (CreateNewMat now has 2 outputs)
         coinc_mat, coinc_mat_no_scatter = CreateNewMat(num_gamma_rays, arr_size, transition_scheme.copy(), 0)
 
     transition_mat = CreateTransitionMatFromTransitionScheme(transition_scheme.copy())
 
+    # Also return the transition scheme to create the level schemes later
+
     return coinc_mat, coinc_mat_no_scatter, transition_mat, transition_scheme
 
-def main(create_new_mat=True, sim_size=0, custom_transition_scheme=True, out_dir="."):
-    coinc_mat, coinc_mat_no_scatter, transition_mat, transition_scheme = CreateSample(3, True)
 
-    SaveMat(coinc_mat, os.path.join(out_dir, "yy_coincidence_matrix.mat"))
-    SaveMat(coinc_mat_no_scatter, os.path.join(out_dir, "yy_coincidence_matrix_no_scatter.mat"))
-    SaveMat(transition_mat, os.path.join(out_dir, "transition_matrix.mat"))
+def main(create_new_mat=True, sim_size=0, custom_transition_scheme=True, out_dir="./data", n_matrices=100):
+    gbs = [(5, 0.5), (9, 10)]
+    transition_schemes = []
 
-    #Generate matrices with no blur
-    coinc_mat_no_blur = np.clip(np.copy(coinc_mat), 1, None)
-    coinc_mat_no_scatter_no_blur = np.clip(np.copy(coinc_mat_no_scatter), 1, None)
+    if n_matrices == 1:
+        out_dir = "."
+        coinc_mat, coinc_mat_clean, transition_mat, transition_scheme = CreateSample(3, True)
 
-    SaveGraph(
-        coinc_mat_no_blur,
-        out_dir,
-        "Sample Generated YY Matrix",
-        norm="log",
-        vmin=None,
-        vmax=None,
-        )
-    SaveGraph(
-        coinc_mat_no_scatter_no_blur,
-        out_dir,
-        "Sample Generated YY Matrix No Scatter",
-        norm="log",
-        vmin=None,
-        vmax=None,
-    )
+        plot_branching_level_scheme(transition_scheme, "Level Scheme")
 
-    #Increasing the size of the kernel and the std value
-    gb_size = 9
-    gb = np.zeros((gb_size, gb_size))
-
-    for gb_i in range(gb_size):
-        for gb_j in range(gb_size):
-            gb[gb_i][gb_j] = Gauss2D(
-                2 * (gb_i - gb_size / 2) / gb_size,
-                0,
-                10,
-                2 * (gb_j - gb_size / 2) / gb_size,
-                0,
-                10,
-            )
-
-    gb = gb / gb.sum()
+        SaveMat(coinc_mat, os.path.join(out_dir, "yy_coincidence_matrix.mat"))
+        SaveMat(coinc_mat_clean, os.path.join(out_dir, "yy_coincidence_matrix_clean.mat"))
+        SaveMat(transition_mat, os.path.join(out_dir, "transition_matrix.mat"))
     
-    coinc_mat_alt = convolve(coinc_mat, gb)
-    coinc_mat_no_scatter_alt = convolve(coinc_mat_no_scatter, gb)
+        #Generate matrices with no blur
+        coinc_mat_no_blur = np.clip(np.copy(coinc_mat), 1, None)
+        coinc_mat_clean_no_blur = np.clip(np.copy(coinc_mat_clean), 1, None)
 
-    blurry_coinc_mat = np.copy(coinc_mat_alt)
-    coinc_mat_copy_alt = np.clip(np.copy(blurry_coinc_mat), 1, None)
-    blurry_coinc_mat_no_scatter = np.copy(coinc_mat_no_scatter_alt)
-    coinc_mat_no_scatter_copy_alt = np.clip(np.copy(blurry_coinc_mat_no_scatter), 1, None)
-    
-    SaveGraph(
-        coinc_mat_copy_alt,
-        out_dir,
-        "Sample Generated YY Matrix (gb_size = 9, std = 10)",
-        norm="log",
-        vmin=None,
-        vmax=None,
+        SaveGraph(
+            coinc_mat_no_blur,
+            out_dir,
+            "Sample Generated YY Matrix",
+            norm="log",
+            vmin=None,
+            vmax=None,
         )
-    SaveGraph(
-        coinc_mat_no_scatter_copy_alt,
-        out_dir,
-        "Sample Generated YY Matrix No Scatter(gb_size = 9, std = 10)",
-        norm="log",
-        vmin=None,
-        vmax=None,
-    )
+        SaveGraph(
+            coinc_mat_clean_no_blur,
+            out_dir,
+            "Sample Generated YY Matrix No Scatter",
+            norm="log",
+            vmin=None,
+            vmax=None,
+        )
 
-    SaveMat(coinc_mat, os.path.join(out_dir, "gaussian_coincidence_matrix.mat"))
-    SaveMat(coinc_mat_alt, os.path.join(out_dir, "gaussian_coincidence_matrix_enhanced.mat"))
+        for gblur in gbs:
+            gb_size = gblur[0]
+            gb = np.zeros((gb_size, gb_size))
 
+            for gb_i in range(gb_size):
+                for gb_j in range(gb_size):
+                    gb[gb_i][gb_j] = Gauss2D(
+                        2 * (gb_i - gb_size / 2) / gb_size,
+                        0,
+                        gblur[1],
+                        2 * (gb_j - gb_size / 2) / gb_size,
+                        0,
+                        gblur[1],
+                    )
+
+            gb = gb / gb.sum()
+
+            coinc_mat = convolve(coinc_mat, gb)
+            coinc_mat_clean = convolve(coinc_mat_clean, gb)
+
+            blurry_coinc_mat = np.copy(coinc_mat)
+            coinc_mat_copy = np.clip(np.copy(blurry_coinc_mat), 1, None)
+            blurry_coinc_mat_clean = np.copy(coinc_mat_clean)
+            coinc_mat_clean_copy = np.clip(np.copy(blurry_coinc_mat_clean), 1, None)
+
+            SaveGraph(
+                coinc_mat_copy,
+                out_dir,
+                f"Sample Generated YY Matrix (gb_size = {gb_size}, std = {gblur[1]})",
+                norm="log",
+                vmin=None,
+                vmax=None,
+                )
+            SaveGraph(
+                coinc_mat_clean_copy,
+                out_dir,
+                f"Sample Generated YY Matrix No Scatter (gb_size = {gb_size}, std = {gblur[1]})",
+                norm="log",
+                vmin=None,
+                vmax=None,
+                )
+            
+            SaveMat(coinc_mat, os.path.join(out_dir, f"gaussian_coincidence_matrix({gb_size}, {gblur[1]}).mat"))
+            SaveMat(coinc_mat_clean, os.path.join(out_dir, f"gaussian_coincidence_matrix_clean({gb_size}, {gblur[1]}).mat"))
+
+        return transition_schemes
+
+
+    for i in range(n_matrices):
+        coinc_mat, coinc_mat_clean, transition_mat, transition_scheme = CreateSample(3, True)
+
+        plot_branching_level_scheme(transition_scheme, f"Level Scheme ({i})")
+
+        transition_schemes.append(transition_scheme)
+
+        SaveMat(coinc_mat, os.path.join(f"{out_dir}/NonBlurredArrays", f"yy_coincidence_matrix({i}).mat"))
+        SaveMat(coinc_mat_clean, os.path.join(f"{out_dir}/NonBlurredArrays", f"yy_coincidence_matrix_clean({i}).mat"))
+        SaveMat(transition_mat, os.path.join(f"{out_dir}/TransitionMats", f"transition_matrix({i}).mat"))
+    
+        #Generate matrices with no blur
+        coinc_mat_no_blur = np.clip(np.copy(coinc_mat), 1, None)
+        coinc_mat_clean_no_blur = np.clip(np.copy(coinc_mat_clean), 1, None)
+
+        SaveGraph(
+            coinc_mat_no_blur,
+            f"{out_dir}/NoBlurGraphs",
+            f"Sample Generated YY Matrix ({i})",
+            norm="log",
+            vmin=None,
+            vmax=None,
+        )
+        SaveGraph(
+            coinc_mat_clean_no_blur,
+            f"{out_dir}/NoBlurGraphs",
+            f"Sample Generated YY Matrix No Scatter ({i})",
+            norm="log",
+            vmin=None,
+            vmax=None,
+        )
+
+        for gblur in gbs:
+            gb_size = gblur[0]
+            gb = np.zeros((gb_size, gb_size))
+
+            for gb_i in range(gb_size):
+                for gb_j in range(gb_size):
+                    gb[gb_i][gb_j] = Gauss2D(
+                        2 * (gb_i - gb_size / 2) / gb_size,
+                        0,
+                        gblur[1],
+                        2 * (gb_j - gb_size / 2) / gb_size,
+                        0,
+                        gblur[1],
+                    )
+
+            gb = gb / gb.sum()
+
+            coinc_mat = convolve(coinc_mat, gb)
+            coinc_mat_clean = convolve(coinc_mat_clean, gb)
+
+            blurry_coinc_mat = np.copy(coinc_mat)
+            coinc_mat_copy = np.clip(np.copy(blurry_coinc_mat), 1, None)
+            blurry_coinc_mat_clean = np.copy(coinc_mat_clean)
+            coinc_mat_clean_copy = np.clip(np.copy(blurry_coinc_mat_clean), 1, None)
+
+            SaveGraph(
+                coinc_mat_copy,
+                f"{out_dir}/BlurredGraphs",
+                f"Sample Generated YY Matrix {i} (gb_size = {gb_size}, std = {gblur[1]})",
+                norm="log",
+                vmin=None,
+                vmax=None,
+                )
+            SaveGraph(
+                coinc_mat_clean_copy,
+                f"{out_dir}/BlurredGraphs",
+                f"Sample Generated YY Matrix No Scatter {i} (gb_size = {gb_size}, std = {gblur[1]})",
+                norm="log",
+                vmin=None,
+                vmax=None,
+                )
+            
+            SaveMat(coinc_mat, os.path.join(f"{out_dir}/BlurredArrays", f"gaussian_coincidence_matrix({gb_size}, {gblur[1]}){i}.mat"))
+            SaveMat(coinc_mat_clean, os.path.join(f"{out_dir}/BlurredArrays", f"gaussian_coincidence_matrix_clean({gb_size}, {gblur[1]}){i}.mat"))
+
+    return transition_schemes
+        
 if __name__ == "__main__":
-    main()
-
-with open('yy_coincidence_matrix_no_scatter.mat', 'rb') as f:
-    coincidence_matrix = pickle.load(f)
-
-def GetCoincidencePairs(coincidence_matrix):
-    coincidences = np.transpose(np.nonzero(coincidence_matrix))
-
-    coincidence_pairs = {}
-    previous_coincidence = 0
-    coincidence_list = []
-    for i, coincidence in enumerate(coincidences):
-        current_coincidence = int(coincidence[0])
-        if current_coincidence == previous_coincidence:
-            coincidence_list.append(int(coincidence[1]))
-            coincidence_pairs[int(coincidence[0])] = coincidence_list
-        else:
-            coincidence_list = []
-            coincidence_list.append(int(coincidence[1]))
-            coincidence_pairs[int(coincidence[0])] = coincidence_list
-
-        previous_coincidence = current_coincidence
-    
-    return coincidence_pairs
-
-def _find_maximal_cliques(coinc_dict):
-    '''This function still needs work -- not getting the correct level schemes (gammas are being used more than once)'''
-    adj = {g: set(coinc_dict[g]) for g in coinc_dict}
-    cliques = []
-
-    def bk(R, P, X):
-        if not P and not X:
-            if len(R) >= 2:
-                cliques.append(sorted(R))
-            return
-        u = max(P | X, key=lambda v: len(adj.get(v, set()) & P))
-        for v in list(P - adj.get(u, set())):
-            bk(R | {v}, P & adj[v], X & adj[v])
-            P -= {v}
-            X |= {v}
-
-    bk(set(), set(coinc_dict.keys()), set())
-    return cliques
-
-
-def _auto_order_cascades(coinc_dict):
-    '''
-    Function for ordering the level scheme if we don't have a specific ordering
-    '''
-    gammas = set(coinc_dict.keys())
-    adj    = {g: set(coinc_dict[g]) for g in coinc_dict}
-    spine  = {g for g in gammas if len(adj[g]) == len(gammas) - 1}
-
-    cascades = []
-    for clique in _find_maximal_cliques(coinc_dict):
-        branches = sorted([g for g in clique if g not in spine], reverse=True)
-        spines   = sorted([g for g in clique if g in spine],     reverse=True)
-        cascades.append(branches + spines)
-    return cascades
-
-
-def _assign_energies(cascades):
-    '''
-    Assign keV values to intermediate states
-    '''
-    level_set = {0}
-    trans_set = set()
-
-    for cascade in cascades:
-        energies = [sum(cascade[k:]) for k in range(len(cascade))] + [0]
-        for k in range(len(cascade)):
-            trans_set.add((energies[k], energies[k + 1], cascade[k]))
-        level_set.update(energies)
-
-    return sorted(level_set), list(trans_set)
-
-def plot_level_scheme(coinc_dict, fig_name="Level Scheme", manual_order=None):
-    cascades = manual_order if manual_order else _auto_order_cascades(coinc_dict)
-
-    levels, transitions = _assign_energies(cascades)
-
-    level_cascade_map = {e: set() for e in levels}
-    for ci, cascade in enumerate(cascades):
-        for k in range(len(cascade) + 1):
-            level_cascade_map[sum(cascade[k:])].add(ci)
-
-    n = len(cascades)
-    e_range = max(levels) - min(levels) or 1
-    to_y = lambda e: (e - min(levels)) / e_range * 0.80 + 0.10
-
-    def get_x(energy):
-        cis = level_cascade_map[energy]
-        if len(cis) > 1:
-            return 0.50
-        ci = next(iter(cis))
-        return 0.15 + ci * 0.70 / max(n - 1, 1)
-
-    colors = ['#8e44ad', "#0061a1", '#27ae60', '#e67e22',
-              '#c0392b', '#1abc9c', '#d35400', '#2c3e50']
-    hw = max(0.06, 0.14 - n * 0.01)
-
-    fig, ax = plt.subplots(figsize=(50, 25))
-
-    for e in levels:
-        y, xc = to_y(e), get_x(e)
-        ax.hlines(y, xc - hw, xc + hw, colors='black',
-                  linewidth=3 if e == 0 else 2)
-        ax.text(xc, y + 0.012,
-                f"GS  0 keV" if e == 0 else f"{int(e)} keV",
-                ha='center', va='bottom', fontsize=8)
-
-    for i, (e_hi, e_lo, g_e) in enumerate(sorted(transitions)):
-        y1, y2 = to_y(e_hi), to_y(e_lo)
-        x1, x2 = get_x(e_hi), get_x(e_lo)
-        color = colors[i % len(colors)]
-        ax.annotate("", xy=(x2, y2 + 0.01), xytext=(x1, y1 - 0.01),
-                    arrowprops=dict(arrowstyle="->", color=color, lw=1.8))
-        ax.text((x1 + x2) / 2 + 0.03, (y1 + y2) / 2,
-                f"{g_e}", color=color, fontsize=8.5, va='center')
-
-    ax.set_xlim(0, 1)
-    ax.set_ylim(0, 1)
-    ax.axis('off')
-    ax.set_title(fig_name, fontsize=11)
-    fig.tight_layout()
-    fig.savefig(f"{fig_name}.png", dpi=150, bbox_inches='tight')
-    plt.show()
-
-coinc_dict = GetCoincidencePairs(coincidence_matrix)
-
-plot_level_scheme(coinc_dict, "Level Scheme")
+    transition_schemes = main(n_matrices=50)
