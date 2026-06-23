@@ -1,95 +1,619 @@
+from re import X
+
 import numpy as np
-import pandas as pd
-from PIL import Image
-from scipy.ndimage import label, center_of_mass
+import pickle
+import matplotlib.pyplot as plt
+from matplotlib.cm import ScalarMappable
+import scipy
+from scipy.ndimage import gaussian_filter
+import os
+from itertools import combinations
+
+def lerp(a, b, p):
+    return b * p + a * (1 - p)
+
+
+def SaveMat(data, file_name):
+    with open(file_name, "wb") as file:
+        pickle.dump(data, file)
+
+    print(f"Saved Mat {file_name}")
+
+
+def LoadMat(file_name):
+    with open(file_name, "rb") as file:
+        data = pickle.load(file)
+    return np.copy(data)
+
+
+def Gauss(x, mu, sigma):
+    return (
+        1
+        / np.sqrt(2 * np.pi * sigma * sigma)
+        * np.exp(-((x - mu) ** 2) / (2 * sigma * sigma))
+    )
+
+
+def Gauss2D(x, xmu, xsigma, y, ymu, ysigma):
+    return Gauss(x, xmu, xsigma) * Gauss(y, ymu, ysigma)
+
+
+def SaveGraph(
+    input, out_dir=".", fig_name="Matrix", cmap="hot", norm="linear", vmin=0, vmax=1
+):
+    fig, ax = plt.subplots(figsize=(10, 10))
+
+    if norm == "linear":
+        counts = ax.imshow(input, cmap=cmap, norm=norm)
+    elif norm == "log":
+        counts = ax.imshow(input, cmap=cmap, norm=norm, vmin=vmin, vmax=vmax)
+    ax.yaxis.set_inverted(False)
+
+    fig.suptitle(fig_name)
+    fig.colorbar(counts, ax=ax)
+    fig.tight_layout()
+    fig.savefig(os.path.join(out_dir, f"{fig_name}.svg"))
+    plt.close()
+    print(f"Saved Graph {fig_name}")
+
+
+def ProjectionGraph(input, fig_name="Matrix"):
+    fig, ax = plt.subplots(figsize=(10, 10))
+    ax.yaxis.set_inverted(False)
+
+    projectionx = input.max(axis=0)
+    projectiony = input.max(axis=1)
+
+    ax.plot(
+        np.linspace(0, len(projectionx), len(projectionx)),
+        projectionx,
+        label="Projection X",
+    )
+    ax.plot(
+        np.linspace(0, len(projectiony), len(projectiony)),
+        projectiony,
+        label="Projection Y",
+    )
+
+    ax.legend()
+    fig.suptitle(fig_name)
+    fig.tight_layout()
+    fig.savefig(f"{fig_name}.png")
+    plt.close()
+    print(f"Saved Graph {fig_name}")
+
+
+def LineGraph(input, fig_name="Matrix"):
+    fig, ax = plt.subplots(figsize=(10, 10))
+    ax.yaxis.set_inverted(False)
+    ax.plot(np.linspace(0, len(input), len(input)), input, label="Projection")
+
+    ax.legend()
+    fig.suptitle(fig_name)
+    fig.tight_layout()
+    fig.savefig(f"{fig_name}.png")
+    plt.close()
+    print(f"Saved Graph {fig_name}")
+
+
+def convolve(input, kernel):
+    output = scipy.signal.convolve(input, kernel, mode="same")
+    return output
+
+def apply_compton(x, y, chance_to_scatter=0.9):
+    if np.random.rand() < chance_to_scatter:
+        # Compton Escape Scattering
+        if np.random.rand() < 0.5:
+            x = x * np.random.rand()
+            y = y
+        else:
+            x = x
+            y = y * np.random.rand()
+    if np.random.rand() < chance_to_scatter * 1 / 3:
+        # Compton Cross Scattering
+        p = np.random.rand()
+        xo = x
+        yo = y
+        x = lerp(xo, yo, p)
+        y = lerp(xo, yo, (1 - p))
+
+        if np.random.rand() < chance_to_scatter:
+            # Compton Escape Scattering when entering the second detector
+            if np.random.rand() < 0.5:
+                x = x * np.random.rand()
+                y = y
+            else:
+                x = x
+                y = y * np.random.rand()
+    return (int(x), int(y))
+
+def CreateNewMat(num_gamma_rays, size_mat, level_scheme, chance_to_scatter):
+    #Create a matrix with and without scattering for peak comparison
+    coinc_mat = np.zeros((size_mat, size_mat))
+    coinc_mat_no_scatter = np.zeros((size_mat, size_mat))
+
+    #Create the actual decay sequence
+    n_levels = len(level_scheme)
+    sequence = {}
+    for start in range(1, n_levels):
+        gammas = []
+        current_idx = int(start)
+ 
+        while current_idx != -1:
+            ev_current, next_idx, _ = level_scheme[current_idx]
+            next_idx = int(next_idx)
+ 
+            if next_idx == -1:
+                break
+ 
+            ev_next, _, _ = level_scheme[next_idx]
+            gamma_e = int(ev_current) - int(ev_next)
+
+            if 0 < gamma_e < size_mat:
+                gammas.append(gamma_e)
+ 
+            current_idx = next_idx
+ 
+        sequence[start] = gammas
+
+    #Fills both scattered and non-scattered matrices
+    for _ in range(num_gamma_rays):
+        #Start at a random energy level and its list of emissions
+        start_idx = np.random.randint(1, n_levels)
+        gammas = sequence[start_idx]
+
+        if len(gammas) < 2:
+            continue
+
+        #Start filling the matrices
+        for i in range(len(gammas)):
+            for j in range(i + 1, len(gammas)):
+                x, y = gammas[i], gammas[j]
+
+                #Always adds to non-scattered matrix
+                if 0 <= x < size_mat and 0 <= y < size_mat:
+                    coinc_mat_no_scatter[x][y] += 1
+                    coinc_mat_no_scatter[y][x] += 1
+                
+                #Apply the comptom scattering and add those scattered values to the coincidence matrix
+                if chance_to_scatter > 0:
+                    x, y = apply_compton(x, y, chance_to_scatter)
+
+                if 0 <= x < size_mat and 0 <= y < size_mat:
+                    coinc_mat[x][y] += 1
+                    coinc_mat[y][x] += 1
+
+    print("Done Generating Matrices")
+
+    #Return both a scattered and non-scattered matrix for comparison
+    return np.copy(coinc_mat), np.copy(coinc_mat_no_scatter)
+
+
+def CreateCustomTransitionScheme(specify_by_index=True):
+    transition_scheme = []
+
+    print("Not Implemented")
+    gamma, next_gamma = [], []
+
+    for i, transition in enumerate(gamma):
+        next_transition = []
+        for j in next_gamma[i]:
+            if j in gamma:
+                next_transition.append(gamma.index(j))
+            else:
+                next_transition.append(-1)
+
+        transition_scheme.append((transition, next_transition, i))
+
+    return gamma.copy(), transition_scheme.copy()
+
+
+def CreateNewTransitionScheme(ev_levels):
+    transition_scheme = []
+
+    for i, level in enumerate(ev_levels):
+        if i > 4 and np.random.rand() < 0.30:
+            next_level = i - np.random.randint(2, i - 2)
+            if next_level <= 0:
+                next_level = 0
+        else:
+            next_level = i - 1
+        transition_scheme.append((level, next_level, i))
+
+    transition_scheme[0] = (transition_scheme[0][0], -1, transition_scheme[0][2])
+    return np.copy(transition_scheme)
+
+
+def CreateTransitionMatFromTransitionScheme(transition_scheme):
+    transition_mat = np.zeros((len(transition_scheme), len(transition_scheme)))
+
+    for i, level in enumerate(transition_scheme):
+        ev_level, transition_idx, idx = level
+        if transition_idx == -1:
+            continue
+
+        transition_mat[i][transition_idx] = 1
+
+    return np.copy(transition_mat)
+
+
+def CreateSample(sim_size, draw_background, custom_transition_scheme=False):
+    num_levels = 1
+    if sim_size == 0:
+        arr_size = 2048
+        num_levels = 12
+        num_gamma_rays = 25_000
+    elif sim_size == 1:
+        arr_size = 1024
+        num_levels = 12
+        num_gamma_rays = 1_250_000
+    elif sim_size == 2:
+        arr_size = 2048
+        num_levels = 25
+        num_gamma_rays = 2_500_000
+    else:
+        arr_size = 4096
+        num_levels = 50
+        num_gamma_rays = 2_000_000
+
+    if custom_transition_scheme:
+        ev_levels, transition_scheme = CreateCustomTransitionScheme(True)
+    else:
+        ev_levels = []
+        ev_levels.append(0)
+        for i in range(num_levels):
+            eV = min(int(np.random.rayleigh(arr_size / 3 + 20)), arr_size - 20)
+            while eV in ev_levels:
+                eV = min(
+                    int(np.random.rayleigh(arr_size / 3 + 20)),
+                    arr_size - 20,
+                )
+
+            ev_levels.append(eV)
+
+        transition_scheme = CreateNewTransitionScheme(np.copy(ev_levels))
+
+    if draw_background:
+        coinc_mat, coinc_mat_no_scatter = CreateNewMat(
+            num_gamma_rays, arr_size, transition_scheme.copy(), 0.45
+        )
+    else:
+        coinc_mat, coinc_mat_no_scatter = CreateNewMat(num_gamma_rays, arr_size, transition_scheme.copy(), 0)
+
+    transition_mat = CreateTransitionMatFromTransitionScheme(transition_scheme.copy())
+
+    return coinc_mat, coinc_mat_no_scatter, transition_mat, transition_scheme
+
+def main(create_new_mat=True, sim_size=0, custom_transition_scheme=True, out_dir="."):
+    coinc_mat, coinc_mat_no_scatter, transition_mat, transition_scheme = CreateSample(3, True)
+
+    SaveMat(coinc_mat, os.path.join(out_dir, "yy_coincidence_matrix.mat"))
+    SaveMat(coinc_mat_no_scatter, os.path.join(out_dir, "yy_coincidence_matrix_no_scatter.mat"))
+    SaveMat(transition_mat, os.path.join(out_dir, "transition_matrix.mat"))
+
+    #Generate matrices with no blur
+    coinc_mat_no_blur = np.clip(np.copy(coinc_mat), 1, None)
+    coinc_mat_no_scatter_no_blur = np.clip(np.copy(coinc_mat_no_scatter), 1, None)
+
+    SaveGraph(
+        coinc_mat_no_blur,
+        out_dir,
+        "Sample Generated YY Matrix",
+        norm="log",
+        vmin=None,
+        vmax=None,
+        )
+    SaveGraph(
+        coinc_mat_no_scatter_no_blur,
+        out_dir,
+        "Sample Generated YY Matrix No Scatter",
+        norm="log",
+        vmin=None,
+        vmax=None,
+    )
+
+    #Increasing the size of the kernel and the std value
+    gb_size = 9
+    gb = np.zeros((gb_size, gb_size))
+
+    for gb_i in range(gb_size):
+        for gb_j in range(gb_size):
+            gb[gb_i][gb_j] = Gauss2D(
+                2 * (gb_i - gb_size / 2) / gb_size,
+                0,
+                10,
+                2 * (gb_j - gb_size / 2) / gb_size,
+                0,
+                10,
+            )
+
+    gb = gb / gb.sum()
+    
+    coinc_mat_alt = convolve(coinc_mat, gb)
+    coinc_mat_no_scatter_alt = convolve(coinc_mat_no_scatter, gb)
+
+    blurry_coinc_mat = np.copy(coinc_mat_alt)
+    coinc_mat_copy_alt = np.clip(np.copy(blurry_coinc_mat), 1, None)
+    blurry_coinc_mat_no_scatter = np.copy(coinc_mat_no_scatter_alt)
+    coinc_mat_no_scatter_copy_alt = np.clip(np.copy(blurry_coinc_mat_no_scatter), 1, None)
+    
+    SaveGraph(
+        coinc_mat_copy_alt,
+        out_dir,
+        "Sample Generated YY Matrix (gb_size = 9, std = 10)",
+        norm="log",
+        vmin=None,
+        vmax=None,
+        )
+    SaveGraph(
+        coinc_mat_no_scatter_copy_alt,
+        out_dir,
+        "Sample Generated YY Matrix No Scatter(gb_size = 9, std = 10)",
+        norm="log",
+        vmin=None,
+        vmax=None,
+    )
+
+    SaveMat(coinc_mat, os.path.join(out_dir, "gaussian_coincidence_matrix.mat"))
+    SaveMat(coinc_mat_alt, os.path.join(out_dir, "gaussian_coincidence_matrix_enhanced.mat"))
+
+if __name__ == "__main__":
+    main()
+
+with open('yy_coincidence_matrix_no_scatter.mat', 'rb') as f:
+    coincidence_matrix = pickle.load(f)
+
+def GetCoincidencePairs(coincidence_matrix):
+    coincidences = np.transpose(np.nonzero(coincidence_matrix))
+
+    coincidence_pairs = {}
+    previous_coincidence = 0
+    coincidence_list = []
+    for i, coincidence in enumerate(coincidences):
+        current_coincidence = int(coincidence[0])
+        if current_coincidence == previous_coincidence:
+            coincidence_list.append(int(coincidence[1]))
+            coincidence_pairs[int(coincidence[0])] = coincidence_list
+        else:
+            coincidence_list = []
+            coincidence_list.append(int(coincidence[1]))
+            coincidence_pairs[int(coincidence[0])] = coincidence_list
+
+        previous_coincidence = current_coincidence
+    
+    return coincidence_pairs
+
+def _find_maximal_cliques(coinc_dict):
+    '''This function still needs work -- not getting the correct level schemes (gammas are being used more than once)'''
+    adj = {g: set(coinc_dict[g]) for g in coinc_dict}
+    cliques = []
+
+    def bk(R, P, X):
+        if not P and not X:
+            if len(R) >= 2:
+                cliques.append(sorted(R))
+            return
+        u = max(P | X, key=lambda v: len(adj.get(v, set()) & P))
+        for v in list(P - adj.get(u, set())):
+            bk(R | {v}, P & adj[v], X & adj[v])
+            P -= {v}
+            X |= {v}
+
+    bk(set(), set(coinc_dict.keys()), set())
+    return cliques
+
+
+def _auto_order_cascades(coinc_dict):
+    '''
+    Function for ordering the level scheme if we don't have a specific ordering
+    '''
+    gammas = set(coinc_dict.keys())
+    adj    = {g: set(coinc_dict[g]) for g in coinc_dict}
+    spine  = {g for g in gammas if len(adj[g]) == len(gammas) - 1}
+
+    cascades = []
+    for clique in _find_maximal_cliques(coinc_dict):
+        branches = sorted([g for g in clique if g not in spine], reverse=True)
+        spines   = sorted([g for g in clique if g in spine],     reverse=True)
+        cascades.append(branches + spines)
+    return cascades
+
+
+def _assign_energies(cascades):
+    '''
+    Assign keV values to intermediate states
+    '''
+    level_set = {0}
+    trans_set = set()
+
+    for cascade in cascades:
+        energies = [sum(cascade[k:]) for k in range(len(cascade))] + [0]
+        for k in range(len(cascade)):
+            trans_set.add((energies[k], energies[k + 1], cascade[k]))
+        level_set.update(energies)
+
+    return sorted(level_set), list(trans_set)
+
+def plot_level_scheme(coinc_dict, fig_name="Level Scheme", manual_order=None):
+    cascades = manual_order if manual_order else _auto_order_cascades(coinc_dict)
+
+    levels, transitions = _assign_energies(cascades)
+
+    level_cascade_map = {e: set() for e in levels}
+    for ci, cascade in enumerate(cascades):
+        for k in range(len(cascade) + 1):
+            level_cascade_map[sum(cascade[k:])].add(ci)
+
+    n = len(cascades)
+    e_range = max(levels) - min(levels) or 1
+    to_y = lambda e: (e - min(levels)) / e_range * 0.80 + 0.10
+
+    def get_x(energy):
+        cis = level_cascade_map[energy]
+        if len(cis) > 1:
+            return 0.50
+        ci = next(iter(cis))
+        return 0.15 + ci * 0.70 / max(n - 1, 1)
+
+    colors = ['#8e44ad', "#0061a1", '#27ae60', '#e67e22',
+              '#c0392b', '#1abc9c', '#d35400', '#2c3e50']
+    hw = max(0.06, 0.14 - n * 0.01)
+
+    fig, ax = plt.subplots(figsize=(50, 25))
+
+    for e in levels:
+        y, xc = to_y(e), get_x(e)
+        ax.hlines(y, xc - hw, xc + hw, colors='black',
+                  linewidth=3 if e == 0 else 2)
+        ax.text(xc, y + 0.012,
+                f"GS  0 keV" if e == 0 else f"{int(e)} keV",
+                ha='center', va='bottom', fontsize=8)
+
+    for i, (e_hi, e_lo, g_e) in enumerate(sorted(transitions)):
+        y1, y2 = to_y(e_hi), to_y(e_lo)
+        x1, x2 = get_x(e_hi), get_x(e_lo)
+        color = colors[i % len(colors)]
+        ax.annotate("", xy=(x2, y2 + 0.01), xytext=(x1, y1 - 0.01),
+                    arrowprops=dict(arrowstyle="->", color=color, lw=1.8))
+        ax.text((x1 + x2) / 2 + 0.03, (y1 + y2) / 2,
+                f"{g_e}", color=color, fontsize=8.5, va='center')
+
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1)
+    ax.axis('off')
+    ax.set_title(fig_name, fontsize=11)
+    fig.tight_layout()
+    fig.savefig(f"{fig_name}.png", dpi=150, bbox_inches='tight')
+    plt.show()
+
+coinc_dict = GetCoincidencePairs(coincidence_matrix)
+
+plot_level_scheme(coinc_dict, "Level Scheme")
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import matplotlib.pyplot as plt
 
 # -----------------------------
-# 1. Load image
+# 1. CNN model
 # -----------------------------
-img = Image.open(
-    r"C:\Users\sdbry\Downloads\matrix1.png"
-).convert("L")
+class CoincidenceCNN(nn.Module):
+    def __init__(self):
+        super().__init__()
 
-gray = np.array(img)
+        self.model = nn.Sequential(
+            nn.Conv2d(1, 8, kernel_size=3, padding=1),
+            nn.ReLU(),
+
+            nn.Conv2d(8, 16, kernel_size=3, padding=1),
+            nn.ReLU(),
+
+            nn.Conv2d(16, 1, kernel_size=3, padding=1),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        return self.model(x)
+
 
 # -----------------------------
-# 2. Crop only the actual plot area
-# Adjust these numbers if needed
+# 2. Make one training example
 # -----------------------------
-plot = gray[115:785, 43:710]
+def make_training_example():
+    coinc_mat, coinc_mat_no_scatter, transition_mat, transition_scheme = CreateSample(
+        sim_size=0,
+        draw_background=True
+    )
 
-height, width = plot.shape
+    X = coinc_mat.astype(np.float32)
+    y = (coinc_mat_no_scatter > 0).astype(np.float32)
+
+    # normalize input
+    X = X / (X.max() + 1e-8)
+
+    # shape: [batch, channel, height, width]
+    X = torch.tensor(X).unsqueeze(0).unsqueeze(0)
+    y = torch.tensor(y).unsqueeze(0).unsqueeze(0)
+
+    return X, y
+
 
 # -----------------------------
-# 3. Energy axis range
+# 3. Train CNN
 # -----------------------------
-x_min, x_max = 0, 2000
-y_min, y_max = 0, 2000
+def train_cnn(num_epochs=20, examples_per_epoch=10):
+    model = CoincidenceCNN()
+
+    criterion = nn.BCELoss()
+    optimizer = optim.Adam(model.parameters(), lr=0.001)
+
+    loss_history = []
+
+    for epoch in range(num_epochs):
+        epoch_loss = 0
+
+        for _ in range(examples_per_epoch):
+            X, y = make_training_example()
+
+            # CNN prediction
+            prediction = model(X)
+
+            # BCE Loss
+            loss = criterion(prediction, y)
+
+            # Metrics
+            pred_binary = (prediction > 0.5).float()
+
+            TP = ((pred_binary == 1) & (y == 1)).sum()
+            FP = ((pred_binary == 1) & (y == 0)).sum()
+            FN = ((pred_binary == 0) & (y == 1)).sum()
+
+            precision = TP / (TP + FP + 1e-8)
+            recall = TP / (TP + FN + 1e-8)
+            f1 = 2 * precision * recall / (precision + recall + 1e-8)
+
+            # Backpropagation
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            epoch_loss += loss.item()
+
+        avg_loss = epoch_loss / examples_per_epoch
+        loss_history.append(avg_loss)
+
+        print(
+            f"Epoch {epoch + 1}/{num_epochs}, "
+            f"Loss={avg_loss:.6f}, "
+            f"Precision={precision.item():.4f}, "
+            f"Recall={recall.item():.4f}, "
+            f"F1={f1.item():.4f}"
+        )
+
+        print(f"Epoch {epoch + 1}/{num_epochs}, Loss: {avg_loss:.6f}")
+
+    return model, loss_history
+
 
 # -----------------------------
-# 4. Detect bright coincidence dots
+# 4. Run training
 # -----------------------------
-threshold = 180
-
-bright_mask = plot >= threshold
-
-labeled, num_features = label(bright_mask)
-
-centers = center_of_mass(
-    bright_mask,
-    labeled,
-    range(1, num_features + 1)
+model, loss_history = train_cnn(
+    num_epochs=20,
+    examples_per_epoch=10
 )
 
-coincidences = []
-
-for center in centers:
-    y_pixel, x_pixel = center
-
-    energy_x = x_min + (x_pixel / width) * (x_max - x_min)
-
-    # y-axis is flipped in image coordinates
-    energy_y = y_max - (y_pixel / height) * (y_max - y_min)
-
-    coincidences.append({
-        "Energy_X_keV": round(energy_x / 100) * 100,
-        "Energy_Y_keV": round(energy_y / 100) * 100
-    })
 
 # -----------------------------
-# 5. Create coincidence table
+# 5. Loss graph
 # -----------------------------
-df = pd.DataFrame(coincidences)
-
-df = df.drop_duplicates()
-df = df.sort_values(["Energy_X_keV", "Energy_Y_keV"])
-
-print("Detected Coincidences:")
-print(df)
-
-df.to_csv(
-    r"C:\Users\sdbry\Downloads\detected_coincidences.csv",
-    index=False
-)
-
-# -----------------------------
-# 6. Group by energy: what each energy sees
-# -----------------------------
-sees_list = (
-    df.groupby("Energy_X_keV")["Energy_Y_keV"]
-    .apply(lambda values: sorted(set(values)))
-    .reset_index()
-)
-
-sees_list = sees_list.rename(columns={
-    "Energy_X_keV": "Energy_keV",
-    "Energy_Y_keV": "Sees_keV"
-})
-
-print("\nWhat each energy sees:")
-print(sees_list)
-
-sees_list.to_csv(
-    r"C:\Users\sdbry\Downloads\energy_sees_list.csv",
-    index=False
-)
+plt.figure(figsize=(8, 5))
+plt.plot(range(1, len(loss_history) + 1), loss_history, marker="o")
+plt.xlabel("Epoch")
+plt.ylabel("Binary Cross Entropy Loss")
+plt.title("CNN Training Loss")
+plt.grid(True)
+plt.savefig("cnn_training_loss.png", dpi=300)
+plt.show()
