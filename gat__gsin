@@ -1,420 +1,794 @@
-import os
 import numpy as np
-import pickle
+import jax
+import jax.numpy as jnp
+from jax import random        # <-- THIS MUST BE JAX RANDOM
+import optax
+
+import random as pyrandom     # <-- PYTHON RANDOM RENAMED
+from sklearn.cluster import KMeans
+from sklearn.metrics import silhouette_score, adjusted_rand_score, normalized_mutual_info_score
+from sklearn.decomposition import PCA
+
 import matplotlib.pyplot as plt
-import scipy
-from scipy.ndimage import label, center_of_mass
-import torch
-import torch.nn.functional as F
-from torch_geometric.nn import GATConv
-from collections import defaultdict, deque
 
 
-# -----------------------------
-# Utility: save/load matrices
-# -----------------------------
-def save_mat(data, file_name):
-    with open(file_name, "wb") as f:
-        pickle.dump(data, f)
+# =========================
+# 1. PHYSICS-INSPIRED CASCADE GENERATORinator
+# =========================
+
+def generate_rotational_band(J_min=0, J_max=10, A=10.0, jitter_keV=5.0):
+    Js = np.arange(J_min, J_max + 1)
+    E_levels = A * Js * (Js + 1)
+    E_levels = E_levels - E_levels.min()
+    E_levels = E_levels + np.random.normal(0.0, jitter_keV, size=E_levels.shape)
+    E_levels = np.clip(E_levels, 0.0, None)
+    gammas = []
+    for i in range(len(E_levels) - 1, 0, -1):
+        Eg = E_levels[i] - E_levels[i - 1]
+        if Eg > 0:
+            gammas.append(Eg)
+    return np.array(gammas, dtype=np.float32)
 
 
-def load_mat(file_name):
-    with open(file_name, "rb") as f:
-        return pickle.load(f)
+def generate_vibrational_band(num_levels=5, base_E=500.0, spacing_keV=200.0, jitter_keV=10.0):
+    E_levels = base_E + spacing_keV * np.arange(num_levels)
+    E_levels = E_levels + np.random.normal(0.0, jitter_keV, size=E_levels.shape)
+    gammas = []
+    for i in range(len(E_levels) - 1, 0, -1):
+        Eg = E_levels[i] - E_levels[i - 1]
+        if Eg > 0:
+            gammas.append(Eg)
+    return np.array(gammas, dtype=np.float32)
 
 
-# -----------------------------
-# Simple Gaussian helpers
-# -----------------------------
-def gauss(x, mu, sigma):
-    return (
-        1.0
-        / np.sqrt(2 * np.pi * sigma * sigma)
-        * np.exp(-((x - mu) ** 2) / (2 * sigma * sigma))
-    )
+def generate_isomeric_state(E_iso_keV=2500.0, lifetime_scale=5.0):
+    # Represent isomer by a single strong transition feeding lower band
+    Eg = E_iso_keV - np.random.uniform(200.0, 600.0)
+    return np.array([Eg], dtype=np.float32)
 
 
-def gauss2d(x, xmu, xsigma, y, ymu, ysigma):
-    return gauss(x, xmu, xsigma) * gauss(y, ymu, ysigma)
-
-
-def convolve(input_arr, kernel):
-    return scipy.signal.convolve(input_arr, kernel, mode="same")
-
-
-# -----------------------------
-# Toy level scheme + transitions
-# -----------------------------
-def create_new_transition_scheme(ev_levels):
-    # ev_levels: list of level energies (in bin units)
-    transition_scheme = []
-    # each entry: (level_energy_bin, next_level_index, level_index)
-    for i, level in enumerate(ev_levels):
-        if i > 4 and np.random.rand() < 0.30:
-            next_level = i - np.random.randint(2, i - 2)
-            if next_level <= 0:
-                next_level = 0
-        else:
-            next_level = i - 1
-        transition_scheme.append((level, next_level, i))
-    # ground state: no further transition
-    transition_scheme[0] = (transition_scheme[0][0], -1, transition_scheme[0][2])
-    return np.copy(transition_scheme)
-
-
-def create_transition_mat_from_scheme(transition_scheme):
-    # adjacency between levels (not γ energies yet)
-    n = len(transition_scheme)
-    transition_mat = np.zeros((n, n))
-    for i, level in enumerate(transition_scheme):
-        ev_level, next_idx, idx = level
-        if next_idx == -1:
-            continue
-        transition_mat[i][next_idx] = 1
-    return transition_mat
-
-
-# -----------------------------
-# Build coincidence matrix from cascades
-# -----------------------------
-def create_coinc_mat(num_gamma_rays, arr_size, transition_scheme, keV_per_bin):
-    # coincidence matrix in bin space
-    coinc_mat = np.zeros((arr_size, arr_size))
-
-    # precompute level energies in keV
-    level_energies_keV = []
-    for level_energy_bin, next_idx, idx in transition_scheme:
-        level_energies_keV.append(level_energy_bin * keV_per_bin)
-
-    # build γ transitions: (from_level_idx, to_level_idx, gamma_energy_keV)
-    gamma_list = []
-    for i, (levE_bin, next_idx, idx) in enumerate(transition_scheme):
-        if next_idx == -1:
-            continue
-        e_i = level_energies_keV[i]
-        e_j = level_energies_keV[next_idx]
-        gamma_E = e_i - e_j
-        if gamma_E <= 0:
-            continue
-        gamma_list.append((i, next_idx, gamma_E))
-
-    # map gamma energies to bin indices
-    def gamma_energy_to_bin(E_keV):
-        # simple linear mapping into [0, arr_size-1]
-        return int(np.clip(E_keV / keV_per_bin, 0, arr_size - 1))
-
-    # simulate cascades: each event follows a path down the scheme
-    for _ in range(num_gamma_rays):
-        # pick a random starting level (not ground)
-        start = np.random.randint(1, len(transition_scheme))
-        path = []
-        cur = start
-        while True:
-            levE_bin, next_idx, idx = transition_scheme[cur]
-            if next_idx == -1:
-                break
-            e_i = level_energies_keV[cur]
-            e_j = level_energies_keV[next_idx]
-            gamma_E = e_i - e_j
-            if gamma_E <= 0:
-                break
-            g_bin = gamma_energy_to_bin(gamma_E)
-            path.append(g_bin)
-            cur = next_idx
-        # fill coincidence matrix with all pairs in the path
-        for i in range(len(path)):
-            for j in range(i + 1, len(path)):
-                x = path[i]
-                y = path[j]
-                coinc_mat[x, y] += 1
-                coinc_mat[y, x] += 1
-
-    return coinc_mat
-
-
-# -----------------------------
-# Create sample: levels, transitions, matrices
-# -----------------------------
-def create_sample(sim_size=0, draw_background=True):
-    if sim_size == 0:
-        arr_size = 2048
-        num_levels = 12
-        num_gamma_rays = 25000
-    elif sim_size == 1:
-        arr_size = 1024
-        num_levels = 12
-        num_gamma_rays = 1250000
-    elif sim_size == 2:
-        arr_size = 2048
-        num_levels = 25
-        num_gamma_rays = 2500000
-    else:
-        arr_size = 4096
-        num_levels = 50
-        num_gamma_rays = 2000000
-
-    # simple keV calibration
-    max_energy_keV = 3000.0
-    keV_per_bin = max_energy_keV / arr_size
-    energy_axis_keV = np.arange(arr_size) * keV_per_bin
-
-    # random level energies in bin units
-    ev_levels = [0]
-    for _ in range(num_levels):
-        e_bin = min(int(np.random.rayleigh(arr_size / 3 + 20)), arr_size - 20)
-        while e_bin in ev_levels:
-            e_bin = min(int(np.random.rayleigh(arr_size / 3 + 20)), arr_size - 20)
-        ev_levels.append(e_bin)
-
-    transition_scheme = create_new_transition_scheme(np.copy(ev_levels))
-    transition_mat = create_transition_mat_from_scheme(transition_scheme.copy())
-
-    coinc_mat = create_coinc_mat(
-        num_gamma_rays, arr_size, transition_scheme.copy(), keV_per_bin
-    )
-
-    # blur with Gaussian kernel to mimic detector response
-    gb_size = 5
-    gb = np.zeros((gb_size, gb_size))
-    for i in range(gb_size):
-        for j in range(gb_size):
-            gb[i][j] = gauss2d(
-                2 * (i - gb_size / 2) / gb_size,
-                0,
-                0.5,
-                2 * (j - gb_size / 2) / gb_size,
-                0,
-                0.5,
-            )
-    coinc_mat = convolve(coinc_mat, gb)
-
-    return coinc_mat, transition_mat, energy_axis_keV
-
-
-# -----------------------------
-# Peak finding + graph building
-# -----------------------------
-def find_threshold(chunk, t):
-    bg = np.median(chunk)
-    return bg + (t * np.sqrt(bg + 1))
-
-
-def coincide(g1, g2, d):
-    return (g2 in d.get(g1, set())) or (g1 in d.get(g2, set()))
-
-
-def build_graph_from_matrix(coinc_mat, energy_axis_keV, t_factor=30):
-    mat_size = coinc_mat.shape[0]
-    chunk_size = 128
-    peaks = np.zeros(coinc_mat.shape, dtype=bool)
-
-    # thresholding
-    for i in range(0, mat_size, chunk_size):
-        for j in range(0, mat_size, chunk_size):
-            chunk = coinc_mat[i:i+chunk_size, j:j+chunk_size]
-            threshold = find_threshold(chunk, t_factor)
-            peaks[i:i+chunk_size, j:j+chunk_size] = chunk > threshold
-
-    # label regions
-    grouped_peaks, num_regions = label(peaks)
-
-    # centroids
-    actual_peaks = center_of_mass(
-        coinc_mat,
-        grouped_peaks,
-        range(1, num_regions + 1)
-    )
-
-    tran_in_coinc = defaultdict(set)
-    intensity_dict = defaultdict(float)
-
-    for y1, y2 in actual_peaks:
-        i = int(round(y1))
-        j = int(round(y2))
-        energy1 = float(energy_axis_keV[i])
-        energy2 = float(energy_axis_keV[j])
-
-        tran_in_coinc[energy1].add(energy2)
-        tran_in_coinc[energy2].add(energy1)
-
-        intensity_dict[energy1] += coinc_mat[i, j]
-        intensity_dict[energy2] += coinc_mat[i, j]
-
-    # build node list
-    tot_trans = set(tran_in_coinc.keys())
-    for t, coincs in tran_in_coinc.items():
-        tot_trans |= coincs
-    sorted_transitions = sorted(tot_trans)
-
-    energy_index = {E: idx for idx, E in enumerate(sorted_transitions)}
-    index_energy = {idx: E for E, idx in energy_index.items()}
-
-    # edges
-    edges = []
-    for t, coincs in tran_in_coinc.items():
-        for t2 in coincs:
-            edges.append((energy_index[t], energy_index[t2]))
-    edge_index = torch.tensor(edges, dtype=torch.long).T
-
-    # node features: [energy_keV, degree, intensity]
-    node_feat = []
-    for E in sorted_transitions:
-        degree = len(tran_in_coinc.get(E, set()))
-        intensity = intensity_dict.get(E, 0.0)
-        node_feat.append([E, degree, intensity])
-    features_node = torch.tensor(node_feat, dtype=torch.float)
-    for col in range(features_node.shape[1]):
-        max_val = features_node[:, col].max()
-        if max_val > 0:
-            features_node[:, col] /= max_val
-
-    return tran_in_coinc, intensity_dict, energy_index, index_energy, edge_index, features_node
-
-
-# -----------------------------
-# Band labels from connected components
-# -----------------------------
-def build_band_labels_from_graph(tran_in_coinc, energy_index):
-    # bands = connected components in coincidence graph
-    # this gives some isolated nodes and some connected groups
-    visited = set()
+def generate_bands_cascade(num_bands=8,
+                           max_gamma_keV=1500.0):
     bands = []
-    for E in energy_index.keys():
-        if E in visited:
+    for b in range(num_bands):
+        kind = np.random.choice(["rot", "vib", "iso"], p=[0.6, 0.3, 0.1])
+        if kind == "rot":
+            J_max = np.random.randint(6, 12)
+            A = np.random.uniform(5.0, 15.0)
+            band = generate_rotational_band(J_min=0, J_max=J_max, A=A)
+        elif kind == "vib":
+            nlev = np.random.randint(3, 7)
+            base_E = np.random.uniform(300.0, 800.0)
+            spacing = np.random.uniform(150.0, 300.0)
+            band = generate_vibrational_band(num_levels=nlev, base_E=base_E, spacing_keV=spacing)
+        else:
+            band = generate_isomeric_state(E_iso_keV=np.random.uniform(1200.0, 2000.0))
+
+        band = band[band > 0]
+        band = band[band < max_gamma_keV]
+        if len(band) >= 2:
+            bands.append(band.astype(np.float32))
+
+    return bands
+
+
+# =========================
+# 2. COINCIDENCE MATRIX BUILDER 
+# =========================
+
+def hpge_fwhm_keV(E_keV, a=0.8, b=0.001, c=1.0):
+    # FWHM(E) ≈ a*sqrt(E) + b*E + c
+    return a * np.sqrt(np.maximum(E_keV, 0.0)) + b * E_keV + c
+
+
+def add_gaussian_peak(matrix, energy_axis_keV, E_gamma, counts):
+    sigma_keV = hpge_fwhm_keV(E_gamma) / 2.355
+    sigma_bins = sigma_keV / (energy_axis_keV[1] - energy_axis_keV[0])
+    centers = E_gamma / (energy_axis_keV[1] - energy_axis_keV[0])
+    x = np.arange(len(energy_axis_keV))
+    profile = np.exp(-0.5 * ((x - centers) / (sigma_bins + 1e-6)) ** 2)
+    profile = profile / (profile.sum() + 1e-8)
+    return matrix + counts * profile
+
+
+def bands_to_coincidence_matrix_cascade(bands,
+                                        arr_size=512,
+                                        keV_max=3000.0,
+                                        num_events=5000,
+                                        noise_level=0.02):
+    import random as pyrandom   # FIX: avoid clobbering jax.random
+
+    keV_per_bin = keV_max / arr_size
+    energy_axis_keV = np.arange(arr_size, dtype=np.float32) * keV_per_bin
+    coinc = np.zeros((arr_size, arr_size), dtype=np.float32)
+
+    for _ in range(num_events):
+        band = pyrandom.choice(bands)   # FIX: Python choice
+
+        if len(band) < 2:
             continue
-        comp = []
-        queue = deque([E])
-        visited.add(E)
-        while queue:
-            cur = queue.popleft()
-            comp.append(cur)
-            for nb in tran_in_coinc.get(cur, []):
-                if nb not in visited:
-                    visited.add(nb)
-                    queue.append(nb)
-        bands.append(comp)
 
-    # assign band IDs
-    band_id_map = {}
-    for b_idx, comp in enumerate(bands):
-        for E in comp:
-            band_id_map[E] = b_idx
+        max_mult = min(len(band), 6)
+        if max_mult < 2:
+            continue
 
-    # build label vector
-    sorted_transitions = sorted(energy_index.keys())
-    labels = []
-    for E in sorted_transitions:
-        labels.append(band_id_map.get(E, -1))
-    return torch.tensor(labels, dtype=torch.long)
+        mult = np.random.randint(2, max_mult + 1)
 
+        idxs = np.random.choice(len(band), size=mult, replace=False)
+        cascade = band[idxs]
+        cascade.sort()
 
-# -----------------------------
-# GAT model
-# -----------------------------
-class Band_Predicting_GAT(torch.nn.Module):
-    def __init__(self, inputs, hidden, out_dim):
-        super().__init__()
-        self.gat1 = GATConv(inputs, hidden, heads=2)
-        self.gat2 = GATConv(hidden * 2, out_dim, heads=1)
+        for i in range(len(cascade)):
+            for j in range(i + 1, len(cascade)):
+                Ei = cascade[i]
+                Ej = cascade[j]
 
-    def forward(self, x, edge_index):
-        x = F.elu(self.gat1(x, edge_index))
-        return self.gat2(x, edge_index)
+                coinc = add_gaussian_peak(coinc, energy_axis_keV, Ei, counts=np.random.uniform(5.0, 20.0))
+                coinc = add_gaussian_peak(coinc, energy_axis_keV, Ej, counts=np.random.uniform(5.0, 20.0))
+
+                bi = int(Ei / keV_per_bin)
+                bj = int(Ej / keV_per_bin)
+                if 0 <= bi < arr_size and 0 <= bj < arr_size:
+                    coinc[bi, bj] += np.random.uniform(5.0, 20.0)
+                    coinc[bj, bi] += np.random.uniform(5.0, 20.0)
+
+    noise = np.random.exponential(scale=noise_level, size=coinc.shape).astype(np.float32)
+    coinc = coinc + noise
+
+    return coinc, energy_axis_keV
 
 
-# -----------------------------
-# Training pipeline
-# -----------------------------
-def train_on_sample(coinc_mat, energy_axis_keV, epochs=300):
-    tran_in_coinc, intensity_dict, energy_index, index_energy, edge_index, features_node = \
-        build_graph_from_matrix(coinc_mat, energy_axis_keV)
+# =========================
+# 3. FAST PEAK EXTRACTOR 
+# =========================
 
-    labels = build_band_labels_from_graph(tran_in_coinc, energy_index)
+def extract_peaks_from_matrix(coinc, energy_axis_keV, min_intensity=5.0):
+    proj = coinc.sum(axis=0)
+    arr_size = len(proj)
 
-    # build training pairs: same-band vs different-band
-    poss = []
-    tar = []
-    num_nodes = labels.shape[0]
-    for i in range(num_nodes):
-        for j in range(i + 1, num_nodes):
-            li = labels[i].item()
-            lj = labels[j].item()
-            if li == -1 or lj == -1:
-                continue
-            poss.append([i, j])
-            tar.append(1.0 if li == lj else 0.0)
+    peaks_idx = []
+    intensity = []
+    index_energy = []
 
-    if len(poss) == 0:
-        print("No labeled pairs; skipping training.")
-        return features_node, edge_index, labels, energy_index, index_energy
+    for i in range(1, arr_size - 1):
+        if proj[i] > min_intensity and proj[i] > proj[i - 1] and proj[i] > proj[i + 1]:
+            peaks_idx.append(i)
+            intensity.append(proj[i])
+            index_energy.append(energy_axis_keV[i])
 
-    possibilities = torch.tensor(poss, dtype=torch.long)
-    targets = torch.tensor(tar, dtype=torch.float)
+    peaks_idx = np.array(peaks_idx, dtype=np.int32)
+    intensity = np.array(intensity, dtype=np.float32)
+    index_energy = np.array(index_energy, dtype=np.float32)
 
-    model = Band_Predicting_GAT(inputs=features_node.shape[1], hidden=16, out_dim=8)
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.01, weight_decay=1e-4)
-
-    for epoch in range(epochs):
-        model.train()
-        optimizer.zero_grad()
-        z = model(features_node, edge_index)
-        first = possibilities[:, 0]
-        second = possibilities[:, 1]
-        sim_score = (z[first] * z[second]).sum(dim=1)
-        loss = F.binary_cross_entropy_with_logits(sim_score, targets)
-        loss.backward()
-        optimizer.step()
-        if epoch % 50 == 0:
-            print(f"Epoch {epoch} | Loss {loss.item():.4f}")
-
-    model.eval()
-    with torch.no_grad():
-        embed = model(features_node, edge_index)
-        normalized = embed / embed.norm(dim=1, keepdim=True)
-        grouping_chances = normalized @ normalized.T
-
-    # group nodes by similarity
-    grouping_threshold = 0.75
-    min_size = 2
-    possible_bands = []
-    num_nodes = embed.shape[0]
-    for i in range(num_nodes):
-        band = [j for j in range(num_nodes)
-                if grouping_chances[i, j] >= grouping_threshold]
-        if len(band) >= min_size:
-            possible_bands.append(band)
-
-    seen = set()
-    unique_groups = []
-    for band in possible_bands:
-        key = frozenset(band)
-        if key not in seen:
-            seen.add(key)
-            unique_groups.append(band)
-
-    print("\nPredicted bands (from embeddings):")
-    for bnum, band in enumerate(unique_groups):
-        energies = [float(index_energy[node]) for node in band]
-        print(f"Band {bnum+1}: {sorted(energies)}")
-
-    return features_node, edge_index, labels, energy_index, index_energy
+    return peaks_idx, index_energy, intensity
 
 
-# -----------------------------
-# Main: generate, train, print
-# -----------------------------
-def main():
-    coinc_mat, transition_mat, energy_axis_keV = create_sample(sim_size=0, draw_background=True)
-    save_mat(coinc_mat, "yy_coincidence_matrix.mat")
-    save_mat(transition_mat, "transition_matrix.mat")
-    save_mat(energy_axis_keV, "energy_axis_keV.mat")
+# =========================
+# 4. GRAPH BUILDER (EDGES with FEATURES)
+# =========================
 
-    train_on_sample(coinc_mat, energy_axis_keV, epochs=300)
+def build_edges_vectorized(index_energy, delta_E=50.0):
+    E = index_energy.astype(np.float32)
+    diff = np.abs(E[:, None] - E[None, :])
+    edge_mask = (diff > 0) & (diff < delta_E)
+    src, dst = np.where(edge_mask)
+    edges = np.stack([src, dst], axis=0)
+    return edges, diff
 
+
+def build_node_features_vectorized(index_energy, intensity, edges, coinc, energy_axis_keV):
+    E = index_energy.astype(np.float32)
+    I = intensity.astype(np.float32)
+    N = E.shape[0]
+
+    E_norm = (E - E.min()) / (E.max() - E.min() + 1e-8)
+
+    src, dst = edges
+    deg = np.zeros(N, dtype=np.float32)
+    np.add.at(deg, src, 1.0)
+    np.add.at(deg, dst, 1.0)
+
+    I_norm = I / (I.max() + 1e-8)
+
+    bin_idx = np.searchsorted(energy_axis_keV, E)
+    bin_idx = np.clip(bin_idx, 0, coinc.shape[0] - 1)
+
+    coinc_strength = coinc[:, bin_idx].sum(axis=0)
+    coinc_strength = coinc_strength / (coinc_strength.max() + 1e-8)
+
+    density = np.sum(np.abs(E[:, None] - E[None, :]) < 20.0, axis=1).astype(np.float32)
+
+    pos_sin = np.sin(2.0 * np.pi * E_norm).astype(np.float32)
+    pos_cos = np.cos(2.0 * np.pi * E_norm).astype(np.float32)
+
+    features_node = np.stack([
+        E_norm,
+        deg,
+        I_norm,
+        coinc_strength,
+        density,
+        pos_sin,
+        pos_cos
+    ], axis=1)
+
+    return features_node
+
+
+def build_graph_from_matrix_optimized(coinc, energy_axis_keV,
+                                      bands, delta_E=50.0, k=8, normalize_features=True):
+    peaks_idx, index_energy, intensity = extract_peaks_from_matrix(
+        coinc, energy_axis_keV, min_intensity=5.0
+    )
+
+    if len(index_energy) == 0:
+        raise ValueError("No peaks detected.")
+
+    edges, diff = build_edges_vectorized(index_energy, delta_E=delta_E)
+    src, dst = edges
+
+    deltaE = diff[src, dst]
+    edge_weights = np.exp(-deltaE / delta_E).astype(np.float32)
+
+    src_sym = np.concatenate([src, dst], axis=0)
+    dst_sym = np.concatenate([dst, src], axis=0)
+    edge_weights_sym = np.concatenate([edge_weights, edge_weights], axis=0)
+    edges_sym = np.array([src_sym, dst_sym])
+
+    def sparsify_edges(edges, edge_weights, k):
+        src, dst = edges
+        N = int(src.max()) + 1
+
+        new_src, new_dst, new_w = [], [], []
+
+        for node in range(N):
+            mask = (src == node)
+            idx = np.where(mask)[0]
+
+            if len(idx) > k:
+                top = idx[np.argsort(edge_weights[idx])[-k:]]
+            else:
+                top = idx
+
+            for t in top:
+                new_src.append(src[t])
+                new_dst.append(dst[t])
+                new_w.append(edge_weights[t])
+
+        return np.array([new_src, new_dst]), np.array(new_w, dtype=np.float32)
+
+    edges_sparse, edge_weights_sparse = sparsify_edges(edges_sym, edge_weights_sym, k)
+
+    features_node = build_node_features_vectorized(
+        index_energy, intensity, edges_sparse, coinc, energy_axis_keV
+    )
+
+    if normalize_features:
+        mean = features_node.mean(axis=0, keepdims=True)
+        std = features_node.std(axis=0, keepdims=True) + 1e-8
+        features_node = (features_node - mean) / std
+
+    return (
+        peaks_idx,
+        intensity,
+        peaks_idx,
+        index_energy,
+        edges_sparse,
+        features_node,
+        index_energy,
+        edge_weights_sparse
+    )
+
+
+# =========================
+# 5. TRUE LABELS FROM BANDS
+# =========================
+
+def build_true_labels(index_energy, bands, atol=20.0):
+    labels = -np.ones(len(index_energy), dtype=np.int32)
+    for b_idx, band in enumerate(bands):
+        for Eg in band:
+            diff = np.abs(index_energy - Eg)
+            idx = np.where(diff < atol)[0]
+            labels[idx] = b_idx
+    return labels
+
+
+# =========================
+# 6. BAND-FOCUSED GRAPH
+# =========================
+
+def build_band_focused_graph(index_energy, features_node, edges, edge_weights,
+                             labels, max_band_keV=1600.0):
+    energy_mask = index_energy <= max_band_keV
+    label_mask = labels >= 0
+    node_mask = energy_mask & label_mask
+
+    new_index = -np.ones_like(index_energy, dtype=np.int32)
+    new_index[node_mask] = np.arange(np.sum(node_mask))
+
+    src, dst = edges
+    keep_edges = node_mask[src] & node_mask[dst]
+
+    src_new = new_index[src[keep_edges]]
+    dst_new = new_index[dst[keep_edges]]
+    edges_new = np.array([src_new, dst_new])
+
+    return (
+        index_energy[node_mask],
+        features_node[node_mask],
+        edges_new,
+        edge_weights[keep_edges],
+        labels[node_mask]
+    )
+
+
+# =========================
+# 7. THREE-LAYER GATv2inator 
+# =========================
+
+def init_gat_params_single(key, in_dim, hidden_dim=32, num_heads=4):
+    k_w, k_att, k_ln = random.split(key, 3)
+
+    W_in = random.normal(k_w, (num_heads, in_dim, hidden_dim)) * 0.1
+    W_att = random.normal(k_att, (num_heads, 2 * hidden_dim, 1)) * 0.1
+
+    gamma = jnp.ones((hidden_dim * num_heads,))
+    beta = jnp.zeros((hidden_dim * num_heads,))
+
+    return {"W_in": W_in, "W_att": W_att, "gamma": gamma, "beta": beta}
+
+
+def init_gat_params_seven_layer(key, in_dim, hidden_dim=32, out_dim=32, num_heads=4):
+    # We need 8 keys: 7 layers + projection head
+    keys = random.split(key, 8)
+
+    layer1 = init_gat_params_single(keys[0], in_dim, hidden_dim, num_heads)
+    layer2 = init_gat_params_single(keys[1], hidden_dim * num_heads, hidden_dim, num_heads)
+    layer3 = init_gat_params_single(keys[2], hidden_dim * num_heads, hidden_dim, num_heads)
+    layer4 = init_gat_params_single(keys[3], hidden_dim * num_heads, hidden_dim, num_heads)
+    layer5 = init_gat_params_single(keys[4], hidden_dim * num_heads, hidden_dim, num_heads)
+    layer6 = init_gat_params_single(keys[5], hidden_dim * num_heads, hidden_dim, num_heads)
+    layer7 = init_gat_params_single(keys[6], hidden_dim * num_heads, hidden_dim, num_heads)
+
+    proj_out = random.normal(keys[7], (hidden_dim * num_heads, out_dim)) * 0.1
+
+    return {
+        "layer1": layer1,
+        "layer2": layer2,
+        "layer3": layer3,
+        "layer4": layer4,
+        "layer5": layer5,
+        "layer6": layer6,
+        "layer7": layer7,
+        "proj_out": proj_out
+    }
+
+
+def layer_norm(x, gamma, beta, eps=1e-5):
+    mean = jnp.mean(x, axis=-1, keepdims=True)
+    var = jnp.mean((x - mean) ** 2, axis=-1, keepdims=True)
+    x_hat = (x - mean) / jnp.sqrt(var + eps)
+    return gamma * x_hat + beta
+
+
+def encode_gat_single(params, features, edges, energy_list, edge_weights, key, dropout_rate=0.1):
+    src, dst = edges
+    x = features
+
+    W_in = params["W_in"]    # (H, F_in, F_h)
+    W_att = params["W_att"]  # (H, 2*F_h, 1)
+    gamma = params["gamma"]
+    beta = params["beta"]
+
+    num_heads, _, hidden_dim = W_in.shape
+    N = x.shape[0]
+
+    # Project input per head: (N, H, F_h)
+    h = jnp.einsum("nf,hfg->nhg", x, W_in)
+
+    h_src = h[src]  # (E, H, F_h)
+    h_dst = h[dst]  # (E, H, F_h)
+    h_cat = jnp.concatenate([h_src, h_dst], axis=-1)  # (E, H, 2*F_h)
+
+    # Attention logits per head: (E, H)
+    att_logits = jnp.einsum("ehg,hg1->eh", h_cat, W_att)
+
+    ew = jnp.array(edge_weights).reshape(-1, 1)
+    att_logits = jnp.clip(att_logits * ew, -10.0, 10.0)
+
+    def normalize_per_head(h_idx):
+        logits_h = att_logits[:, h_idx]
+        max_per_dst = jnp.zeros((N,)) - 1e9
+        max_per_dst = max_per_dst.at[dst].max(logits_h)
+        exp = jnp.exp(logits_h - max_per_dst[dst])
+        sum_per_dst = jnp.zeros((N,))
+        sum_per_dst = sum_per_dst.at[dst].add(exp)
+        return exp / (sum_per_dst[dst] + 1e-8)
+
+    att_weights = jnp.stack(
+        [normalize_per_head(h_idx) for h_idx in range(num_heads)],
+        axis=-1
+    )  # (E, H)
+
+    agg = jnp.zeros((N, num_heads, hidden_dim))
+    agg = agg.at[dst].add(h_src * att_weights[:, :, None])
+
+    agg_cat = agg.reshape(N, num_heads * hidden_dim)
+
+    x_proj = jnp.einsum("nf,hfg->nhg", x, W_in).reshape(N, num_heads * hidden_dim)
+    h_out = layer_norm(agg_cat + x_proj, gamma, beta)
+
+    keep_prob = 1.0 - dropout_rate
+    key, k_drop = random.split(key)
+    mask = random.bernoulli(k_drop, p=keep_prob, shape=h_out.shape)
+    h_out = h_out * mask / keep_prob
+
+    return h_out
+
+
+
+def encode_gat_seven_layer(params, features, edges, energy_list, edge_weights, key):
+    keys = random.split(key, 7)
+
+    h1 = encode_gat_single(params["layer1"], features, edges, energy_list, edge_weights, keys[0])
+    h2 = encode_gat_single(params["layer2"], h1, edges, energy_list, edge_weights, keys[1])
+    h3 = encode_gat_single(params["layer3"], h2, edges, energy_list, edge_weights, keys[2])
+    h4 = encode_gat_single(params["layer4"], h3, edges, energy_list, edge_weights, keys[3])
+    h5 = encode_gat_single(params["layer5"], h4, edges, energy_list, edge_weights, keys[4])
+    h6 = encode_gat_single(params["layer6"], h5, edges, energy_list, edge_weights, keys[5])
+    h7 = encode_gat_single(params["layer7"], h6, edges, energy_list, edge_weights, keys[6])
+
+    return jnp.dot(h7, params["proj_out"])
+
+
+
+def init_classifier_params(key, embed_dim, num_bands):
+    k1, k2 = random.split(key)
+    W = random.normal(k1, (embed_dim, num_bands)) * 0.1
+    b = random.normal(k2, (num_bands,)) * 0.1
+    return {"W_cls": W, "b_cls": b}
+
+
+def band_classifier_head(cls_params, embed):
+    W = cls_params["W_cls"]
+    b = cls_params["b_cls"]
+    logits = jnp.dot(embed, W) + b
+    return logits
+
+
+def supervised_band_loss(logits, labels):
+    mask = labels >= 0
+    logits = logits[mask]
+    labels = labels[mask]
+    return optax.softmax_cross_entropy_with_integer_labels(logits, labels).mean()
+
+
+def contrastive_loss(embed, labels):
+    embed = embed / (jnp.linalg.norm(embed, axis=-1, keepdims=True) + 1e-8)
+    sim = jnp.dot(embed, embed.T) / 0.2
+
+    pos_mask = (labels[:, None] == labels[None, :]).astype(jnp.float32)
+    neg_mask = (labels[:, None] != labels[None, :]).astype(jnp.float32)
+
+    exp_sim = jnp.exp(sim) * neg_mask
+    denom = jnp.sum(exp_sim, axis=-1) + 1e-8
+
+    pos_sim = jnp.exp(sim) * pos_mask
+    num = jnp.sum(pos_sim, axis=-1) + 1e-8
+
+    loss = -jnp.log(num / denom)
+    return jnp.mean(loss)
+
+
+def prototype_loss(embed, labels):
+    num_bands = int(jnp.max(labels)) + 1
+
+    def proto(b):
+        mask = (labels == b).astype(jnp.float32)
+        count = jnp.sum(mask)
+        mean = jnp.sum(embed * mask[:, None], axis=0) / jnp.maximum(count, 1.0)
+        return mean
+
+    prototypes = jax.vmap(proto)(jnp.arange(num_bands))
+    proto_for_points = prototypes[labels]
+    return jnp.mean(jnp.linalg.norm(embed - proto_for_points, axis=-1))
+
+
+def total_loss_two_layer(params_gat, params_cls,
+                         features, edges, labels, energy_list, edge_weights, key):
+
+    embed = encode_gat_seven_layer(params_gat, features, edges, energy_list, edge_weights, key)
+
+
+    mask = labels >= 0
+    embed_l = embed[mask]
+    labels_l = labels[mask]
+
+    loss_c = contrastive_loss(embed_l, labels_l)
+    loss_p = prototype_loss(embed_l, labels_l)
+
+    logits = band_classifier_head(params_cls, embed)
+    loss_sup = supervised_band_loss(logits, labels)
+
+    loss = 0.5 * loss_c + 0.2 * loss_p + 0.3 * loss_sup
+    loss = jnp.nan_to_num(loss)
+
+    return loss, (embed, logits)
+
+
+def train_gat_seven_layer_labeled(features_node, edges, labels, energy_list, edge_weights,
+                                  epochs=320, lr=3e-4):
+
+    key = random.PRNGKey(0)
+
+    # Convert to JAX arrays
+    features_j = jnp.array(features_node)
+    edges_j = tuple(jax.lax.stop_gradient(jnp.array(e)) for e in edges)
+    labels_j = jax.lax.stop_gradient(jnp.array(labels))
+    energy_j = jax.lax.stop_gradient(jnp.array(energy_list))
+    edge_w_j = jax.lax.stop_gradient(jnp.array(edge_weights))
+
+    # Initialize 7-layer GAT
+    params_gat = init_gat_params_seven_layer(key, features_j.shape[-1])
+    params_cls = init_classifier_params(key, embed_dim=32, num_bands=int(labels_j.max()) + 1)
+
+    # AdamW optimizer (better for deeper GATs)
+    optimizer = optax.adamw(lr, weight_decay=1e-4)
+    opt_state = optimizer.init((params_gat, params_cls))
+
+    # Updated loss weights for deeper GAT
+    def total_loss(params_gat, params_cls, key):
+        embed = encode_gat_seven_layer(params_gat, features_j, edges_j,
+                                       energy_j, edge_w_j, key)
+
+        mask = labels_j >= 0
+        embed_l = embed[mask]
+        labels_l = labels_j[mask]
+
+        loss_c = contrastive_loss(embed_l, labels_l)
+        loss_p = prototype_loss(embed_l, labels_l)
+
+        logits = band_classifier_head(params_cls, embed)
+        loss_sup = supervised_band_loss(logits, labels_j)
+
+        # Updated weights: 0.4 / 0.3 / 0.3
+        loss = 0.4 * loss_c + 0.3 * loss_p + 0.3 * loss_sup
+        return jnp.nan_to_num(loss), (embed, logits)
+
+    # Training step
+    def step(params_gat, params_cls, opt_state, key):
+        (loss, (embed, logits)), grads = jax.value_and_grad(
+            lambda pg, pc: total_loss(pg, pc, key),
+            argnums=(0, 1),
+            has_aux=True
+        )(params_gat, params_cls)
+
+        grads_gat, grads_cls = grads
+
+        # Tighter gradient clipping for 7-layer GAT
+        grads_gat = jax.tree_util.tree_map(
+            lambda g: jnp.clip(jnp.nan_to_num(g), -0.5, 0.5),
+            grads_gat
+        )
+        grads_cls = jax.tree_util.tree_map(
+            lambda g: jnp.clip(jnp.nan_to_num(g), -0.5, 0.5),
+            grads_cls
+        )
+
+        updates, opt_state = optimizer.update((grads_gat, grads_cls), opt_state,
+                                              (params_gat, params_cls))
+        params_gat = optax.apply_updates(params_gat, updates[0])
+        params_cls = optax.apply_updates(params_cls, updates[1])
+
+        return params_gat, params_cls, opt_state, jnp.nan_to_num(loss), embed, logits
+
+    # Training loop
+    for epoch in range(0, epochs + 1, 20):
+        key, k_step = random.split(key)
+        params_gat, params_cls, opt_state, loss, embed, logits = step(
+            params_gat, params_cls, opt_state, k_step
+        )
+        print(f"epoch {epoch}, loss {float(loss):.4f}")
+
+    # Final forward pass
+    key, k_final = random.split(key)
+    _, (embed, logits) = total_loss(params_gat, params_cls, k_final)
+
+    return params_gat, params_cls, embed, logits
+# =========================
+# 8. CLUSTERING + EVALUATION + VISUALIZATION
+# =========================
+
+from sklearn.cluster import KMeans
+from sklearn.metrics import adjusted_rand_score, normalized_mutual_info_score
+
+
+def cluster_embeddings(embed, index_energy, num_clusters=None):
+    if num_clusters is None:
+        num_clusters = 8
+    kmeans = KMeans(n_clusters=num_clusters, n_init=10)
+    labels_pred = kmeans.fit_predict(np.array(embed))
+    return labels_pred
+
+
+def evaluate_band_reconstruction(labels_true, labels_pred):
+    mask = labels_true >= 0
+    lt = labels_true[mask]
+    lp = labels_pred[mask]
+    ari = adjusted_rand_score(lt, lp)
+    nmi = normalized_mutual_info_score(lt, lp)
+    print(f"ARI: {ari:.3f}, NMI: {nmi:.3f}")
+
+
+def visualize_embeddings(embed, labels, title="Embeddings"):
+    embed_np = np.array(embed)
+    if embed_np.shape[1] > 2:
+        from sklearn.decomposition import PCA
+        pca = PCA(n_components=2)
+        emb2 = pca.fit_transform(embed_np)
+    else:
+        emb2 = embed_np
+
+    plt.figure(figsize=(6, 5))
+    sc = plt.scatter(emb2[:, 0], emb2[:, 1], c=labels, cmap="tab10", s=20)
+    plt.colorbar(sc)
+    plt.title(title)
+    plt.tight_layout()
+    plt.show()
+
+
+def visualize_matrix_with_peaks(coinc, energy_axis_keV, peaks_idx):
+    plt.figure(figsize=(6, 5))
+    plt.imshow(coinc, origin="lower", cmap="inferno",
+               extent=[energy_axis_keV[0], energy_axis_keV[-1],
+                       energy_axis_keV[0], energy_axis_keV[-1]])
+    plt.colorbar(label="Counts")
+    plt.scatter(energy_axis_keV[peaks_idx], energy_axis_keV[peaks_idx],
+                s=10, c="cyan", label="Peaks")
+    plt.xlabel("Energy (keV)")
+    plt.ylabel("Energy (keV)")
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
+
+
+# ========================= 9. FULL SUPERVISED PIPELINE
+# 9. FULL SUPERVISED PIPELINE
+# =========================
+
+def run_full_pipeline_supervised():
+    # 1. Generate realistic synthetic nuclear bands
+    bands = generate_bands_cascade(num_bands=8, max_gamma_keV=1500.0)
+
+    # 2. Build coincidence matrix with realistic HPGe resolution
+    coinc, energy_axis_keV = bands_to_coincidence_matrix_cascade(
+        bands,
+        arr_size=512,
+        keV_max=3000.0,
+        num_events=5000,
+        noise_level=0.02
+    )
+
+    # 3. Build graph from coincidence matrix
+    peaks_mask, intensity, energy_index, index_energy, edges, features_node, energy_list, edge_weights = \
+        build_graph_from_matrix_optimized(
+            coinc,
+            energy_axis_keV,
+            bands=bands,
+            delta_E=50.0
+        )
+
+    # 4. Assign true band labels to peaks
+    labels = build_true_labels(index_energy, bands, atol=20.0)
+
+    print("Unique labels:", np.unique(labels))
+    print("Label counts (excluding -1):", np.bincount(labels[labels >= 0]))
+
+    # 5. Restrict graph to labeled peaks within energy window
+    index_energy_l, features_node_l, edges_l, edge_w_l, labels_l = \
+        build_band_focused_graph(
+            index_energy,
+            features_node,
+            edges,
+            edge_weights,
+            labels,
+            max_band_keV=1600.0
+        )
+
+    # 6. Train 7-layer GATv2 with supervised + contrastive + prototype loss
+    params_gat, params_cls, embed, logits = train_gat_seven_layer_labeled(
+        features_node_l,
+        edges_l,
+        labels_l,
+        index_energy_l,
+        edge_w_l,
+        epochs=320
+    )
+
+    # 7. Cluster embeddings
+    predicted_l = cluster_embeddings(embed, index_energy_l)
+
+    # 8. Evaluate reconstruction quality
+    evaluate_band_reconstruction(labels_l, predicted_l)
+
+    # 9. Visualizations
+    visualize_embeddings(embed, predicted_l, title="Predicted clusters (labeled-only)")
+    visualize_embeddings(embed, labels_l, title="True bands (labeled-only)")
+    visualize_matrix_with_peaks(coinc, energy_axis_keV, peaks_mask)
+
+    # 10. Return everything needed for downstream analysis
+    return (
+        bands,
+        predicted_l,
+        index_energy_l,
+        features_node_l,
+        edges_l,
+        params_gat,
+        params_cls
+    )
+
+
+# ============================================================
+# 10. VISUALIZATION LAYER
+# ============================================================
+
+def visualize_true_vs_predicted(bands, predicted_labels, index_energy):
+    fig, ax = plt.subplots(1, 2, figsize=(18, 8))
+
+    ax[0].set_title("True Bands")
+    for b_idx, band in enumerate(bands):
+        y = [b_idx] * len(band)
+        ax[0].scatter(band, y, s=80)
+        for g in band:
+            ax[0].text(g, b_idx + 0.05, f"{int(g)} keV", fontsize=8)
+    ax[0].grid(True)
+
+    ax[1].set_title("Predicted Clusters")
+    for p_idx in np.unique(predicted_labels):
+        group_indices = np.where(predicted_labels == p_idx)[0]
+        energies = [index_energy[n] for n in group_indices]
+        y = [p_idx] * len(energies)
+        ax[1].scatter(energies, y, s=80)
+        for e in energies:
+            ax[1].text(e, p_idx + 0.05, f"{int(e)} keV", fontsize=8)
+    ax[1].grid(True)
+
+    plt.tight_layout()
+    plt.show()
+
+
+def visualize_matrix_with_peaks(coinc, energy_axis_keV, peaks_idx):
+    plt.figure(figsize=(6, 5))
+    plt.imshow(
+        coinc,
+        origin="lower",
+        cmap="inferno",
+        extent=[
+            energy_axis_keV[0], energy_axis_keV[-1],
+            energy_axis_keV[0], energy_axis_keV[-1]
+        ]
+    )
+    plt.colorbar(label="Counts")
+
+    # Plot peak markers
+    if peaks_idx is not None and len(peaks_idx) > 0:
+        xs = energy_axis_keV[peaks_idx]
+        ys = energy_axis_keV[peaks_idx]
+        plt.scatter(xs, ys, s=10, c="cyan", label="Peaks")
+
+    plt.xlabel("Energy (keV)")
+    plt.ylabel("Energy (keV)")
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
+
+# ============================================================
+# 11. UNIFIED MAIN PIPELINE ENTRY
+# ============================================================
 
 if __name__ == "__main__":
-    main()
-
+    bands, predicted_l, index_energy_l, features_node_l, edges_l, params_gat, params_cls = run_full_pipeline_supervised()
+    print("Pipeline completed.")
 
 
 
