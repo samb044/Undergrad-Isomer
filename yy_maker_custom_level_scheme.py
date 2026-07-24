@@ -100,40 +100,35 @@ def convolve(input, kernel):
     return output
 
 
-def apply_compton(x, y, chance_to_scatter=0.9):
+def apply_compton(gamma_, chance_to_scatter=0.9):
+    gamma = gamma_
+    cross_gamma = 0
     if np.random.rand() < chance_to_scatter:
         # Compton Escape Scattering
-        if np.random.rand() < 0.5:
-            x = x * np.random.rand()
-            y = y
-        else:
-            x = x
-            y = y * np.random.rand()
-    if np.random.rand() < chance_to_scatter * 1 / 3:
+        gamma = gamma * np.random.rand()
+
+    if np.random.rand() < chance_to_scatter * 1 / 5:
         # Compton Cross Scattering
         p = np.random.rand()
-        xo = x
-        yo = y
-        x = lerp(xo, yo, p)
-        y = lerp(xo, yo, (1 - p))
+        x = lerp(0, gamma, p)
+        cross_gamma = gamma - x
+        gamma = x
 
         if np.random.rand() < chance_to_scatter:
             # Compton Escape Scattering when entering the second detector
-            if np.random.rand() < 0.5:
-                x = x * np.random.rand()
-                y = y
-            else:
-                x = x
-                y = y * np.random.rand()
-    return (int(x), int(y))
+            gamma = gamma * np.random.rand()
+
+    return (int(gamma), int(cross_gamma))
+
 
 
 def CreateNewMat(num_gamma_rays, size_mat, level_scheme, chance_to_scatter):
     #Create a matrix with and without scattering for peak comparison
-    coinc_mat = np.zeros((size_mat, size_mat))
-    coinc_mat_no_scatter = np.zeros((size_mat, size_mat))
-
+    coinc_mat = np.zeros((size_mat, size_mat), dtype=np.float32)
+    coinc_mat_no_scatter = np.zeros((size_mat, size_mat), dtype=np.float32)
+ 
     #Create the actual decay sequence
+    #FIX 1: break before appending so the ground state energy (0) is never added
     n_levels = len(level_scheme)
     sequence = {}
     for start in range(1, n_levels):
@@ -146,45 +141,47 @@ def CreateNewMat(num_gamma_rays, size_mat, level_scheme, chance_to_scatter):
  
             if next_idx == -1:
                 break
-
+ 
             gamma_e = int(gamma_e)
-
+ 
             if 0 < gamma_e < size_mat:
                 gammas.append(gamma_e)
  
             current_idx = next_idx
  
         sequence[start] = gammas
-
+ 
     #Fills both scattered and non-scattered matrices
     for _ in range(num_gamma_rays):
         #Start at a random energy level and its list of emissions
         start_idx = np.random.randint(1, n_levels)
         gammas = sequence[start_idx]
-
+ 
         if len(gammas) < 2:
             continue
-
+ 
+        #Apply Compton scattering to each gamma individually (not per-pair)
+        scattered_gammas = []
+        for gamma in gammas:
+            scattered_e, _ = apply_compton(gamma, chance_to_scatter)
+            scattered_gammas.append(scattered_e)
+ 
         #Start filling the matrices
         for i in range(len(gammas)):
             for j in range(i + 1, len(gammas)):
+                #Always adds to non-scattered matrix (energies already bounds-checked above)
                 x, y = gammas[i], gammas[j]
-
-                #Always adds to non-scattered matrix
-                if 0 <= x < size_mat and 0 <= y < size_mat:
-                    coinc_mat_no_scatter[x][y] += 1
-                    coinc_mat_no_scatter[y][x] += 1
-                
-                #Apply the comptom scattering and add those scattered values to the coincidence matrix
-                if chance_to_scatter > 0:
-                    x, y = apply_compton(x, y, chance_to_scatter)
-
-                if 0 <= x < size_mat and 0 <= y < size_mat:
+                coinc_mat_no_scatter[x][y] += 1
+                coinc_mat_no_scatter[y][x] += 1
+ 
+                #FIX 2: strict lower bound discards gammas scattered below detection threshold
+                x, y = scattered_gammas[i], scattered_gammas[j]
+                if 0 < x < size_mat and 0 < y < size_mat:
                     coinc_mat[x][y] += 1
                     coinc_mat[y][x] += 1
-
+ 
     print("Done Generating Matrices")
-
+ 
     #Return both a scattered and non-scattered matrix for comparison
     return np.copy(coinc_mat), np.copy(coinc_mat_no_scatter)
 
@@ -288,9 +285,22 @@ def CreateSample(sim_size, draw_background, custom_transition_scheme=False):
 
     return coinc_mat, coinc_mat_no_scatter, transition_mat, transition_scheme
 
+def _add_compton_ridge(coinc_mat, continuum_gamma, fixed_gamma, size_mat):
+    """
+    Distribute 1 count uniformly along the Compton continuum.
+    continuum_gamma : the gamma that scattered (energy spans 1 → original)
+    fixed_gamma     : the gamma fully detected (fixes the row/column)
+    """
+    if fixed_gamma <= 0 or fixed_gamma >= size_mat or continuum_gamma <= 1:
+        return
+    weight = 1.0 / continuum_gamma
+    for e in range(1, min(continuum_gamma, size_mat)):
+        coinc_mat[e][fixed_gamma] += weight
+        coinc_mat[fixed_gamma][e] += weight
 
-def main(create_new_mat=True, sim_size=0, custom_transition_scheme=True, out_dir="./data", n_matrices=100):
-    gbs = [(5, 0.5), (9, 10)]
+
+def main(create_new_mat=True, sim_size=0, custom_transition_scheme=True, out_dir="./data", n_matrices=1000):
+    gbs = [(5, 0.5)]
     transition_schemes = []
 
     if n_matrices == 1:
@@ -404,52 +414,7 @@ def main(create_new_mat=True, sim_size=0, custom_transition_scheme=True, out_dir
             vmax=None,
         )
 
-        for gblur in gbs:
-            gb_size = gblur[0]
-            gb = np.zeros((gb_size, gb_size))
-
-            for gb_i in range(gb_size):
-                for gb_j in range(gb_size):
-                    gb[gb_i][gb_j] = Gauss2D(
-                        2 * (gb_i - gb_size / 2) / gb_size,
-                        0,
-                        gblur[1],
-                        2 * (gb_j - gb_size / 2) / gb_size,
-                        0,
-                        gblur[1],
-                    )
-
-            gb = gb / gb.sum()
-
-            coinc_mat = convolve(coinc_mat, gb)
-            coinc_mat_clean = convolve(coinc_mat_clean, gb)
-
-            blurry_coinc_mat = np.copy(coinc_mat)
-            coinc_mat_copy = np.clip(np.copy(blurry_coinc_mat), 1, None)
-            blurry_coinc_mat_clean = np.copy(coinc_mat_clean)
-            coinc_mat_clean_copy = np.clip(np.copy(blurry_coinc_mat_clean), 1, None)
-
-            SaveGraph(
-                coinc_mat_copy,
-                f"{out_dir}/BlurredGraphs",
-                f"Sample Generated YY Matrix {i} (gb_size = {gb_size}, std = {gblur[1]})",
-                norm="log",
-                vmin=None,
-                vmax=None,
-                )
-            SaveGraph(
-                coinc_mat_clean_copy,
-                f"{out_dir}/BlurredGraphs",
-                f"Sample Generated YY Matrix No Scatter {i} (gb_size = {gb_size}, std = {gblur[1]})",
-                norm="log",
-                vmin=None,
-                vmax=None,
-                )
-            
-            SaveMat(coinc_mat, os.path.join(f"{out_dir}/BlurredArrays", f"gaussian_coincidence_matrix({gb_size}, {gblur[1]}){i}.mat"))
-            SaveMat(coinc_mat_clean, os.path.join(f"{out_dir}/BlurredArrays", f"gaussian_coincidence_matrix_clean({gb_size}, {gblur[1]}){i}.mat"))
-
     return transition_schemes
-        
+       
 if __name__ == "__main__":
-    transition_schemes = main(n_matrices=50)
+    transition_schemes = main(n_matrices=50, out_dir="./Isomer-ARL/toy_models/test_matrices")
